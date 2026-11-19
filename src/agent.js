@@ -3,7 +3,8 @@
 // fixes go through human approval in the UI.
 
 const clip = (v, n = 80) => (typeof v === 'string' ? v.slice(0, n) : v);
-const redact = s => s.replace(/Bearer\s+[A-Za-z0-9\-_.]+/g, 'Bearer [REDACTED]').replace(/shpat_[a-f0-9]+/g, 'shpat_[REDACTED]');
+
+import { redactWorkflow } from './engine.js';
 
 // ctx: { runLog: object|null, systems: object, workflow: object|null, audit: [], product: sku => object|null }
 export function agentTools(ctx) {
@@ -13,7 +14,7 @@ export function agentTools(ctx) {
     { name: 'compare_systems', description: 'Reconciles the ERP with the store: product counts, products missing on either side, price and stock differences with examples, and store orders vs ERP sales orders.',
       execute: () => JSON.parse(JSON.stringify(ctx.systems, (k, v) => clip(v))) },
     { name: 'get_workflow', description: 'The n8n workflow (secrets redacted) and the static audit findings for it. Returns available:false if no workflow file was provided.',
-      execute: () => ctx.workflow ? { workflow: JSON.parse(redact(JSON.stringify(ctx.workflow))), audit: ctx.audit.map(a => ({ title: a.title, node: a.node, severity: a.sev })) } : { available: false } },
+      execute: () => ctx.workflow ? { workflow: redactWorkflow(ctx.workflow), audit: ctx.audit.map(a => ({ title: a.title, node: clip(String(a.node || ''), 60), severity: a.sev })) } : { available: false } },
     { name: 'get_product', description: 'One product by SKU as the ERP and the store each hold it.',
       inputSchema: { type: 'object', properties: { sku: { type: 'string' } }, required: ['sku'] },
       execute: ({ sku }) => { const p = ctx.product(String(sku).slice(0, 64)); if (!p) throw new Error('No such SKU'); return JSON.parse(JSON.stringify(p, (k, v) => clip(v))); } },

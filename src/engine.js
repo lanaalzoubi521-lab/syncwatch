@@ -38,13 +38,73 @@ export function replay(world, config) {
   return { shop, runs, orders };
 }
 
-export function scanSecrets(workflow) {
+// Secret scan over the whole workflow: every node (parameters, notes, headers, bodies, JSON strings
+// inside parameters) and pinned data. Reports type, place and length; never any part of the value.
+const SECRET_KEY = /^(authorization|x-api-key|api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|token|secret|client[-_]?secret|password|passwd|pwd|private[-_]?key)$/i;
+const SECRET_VALUE = [
+  ['Bearer token', /\bbearer\s+[A-Za-z0-9\-_.=]{16,}/i],
+  ['Basic auth credentials', /\bbasic\s+[A-Za-z0-9+/=]{12,}/i],
+  ['Shopify access token', /\bshpat_[a-f0-9]{16,}/i],
+  ['API key', /\b(sk|pk|rk)[-_](live|test|proj)?[-_]?[A-Za-z0-9]{16,}/],
+  ['JSON web token', /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/],
+];
+const isExpr = v => /^=|\{\{/.test(v);
+export function findSecrets(root) {
   const hits = [];
-  for (const node of workflow.nodes) {
-    const text = JSON.stringify(node.parameters);
-    for (const p of SECRET_PATTERNS) if (p.re.test(text)) hits.push({ node: node.name, pattern: p.name, length: text.match(p.re)[0].length }); // never echo any part of a secret
-  }
+  const walk = (v, path, place) => {
+    if (v == null) return;
+    if (typeof v === 'string') {
+      if (/^\s*[{[]/.test(v)) { try { walk(JSON.parse(v), path, place); } catch {} }
+      for (const [name, re] of SECRET_VALUE) { const m = v.match(re); if (m && !isExpr(v)) { hits.push({ place, path, pattern: name, length: m[0].length }); return; } }
+      return;
+    }
+    if (Array.isArray(v)) { v.forEach((x, i) => walk(x, path + '[' + i + ']', place)); return; }
+    if (typeof v === 'object') {
+      // {name: 'Authorization', value: '...'} pairs, as n8n stores headers and query parameters
+      const pair = typeof v.name === 'string' && typeof v.value === 'string' && SECRET_KEY.test(v.name.trim()) && v.value.length >= 8 && !isExpr(v.value);
+      if (pair) hits.push({ place, path: path + '.' + v.name, pattern: (SECRET_VALUE.find(([, re]) => re.test(v.value)) || [`Value of "${v.name}"`])[0], length: v.value.length });
+      for (const [k, x] of Object.entries(v)) {
+        if (pair && k === 'value') continue;
+        if (typeof x === 'string' && SECRET_KEY.test(k) && x.length >= 8 && !isExpr(x) && !SECRET_VALUE.some(([, re]) => re.test(x))) hits.push({ place, path: path + '.' + k, pattern: `Value of "${k}"`, length: x.length });
+        else walk(x, path + '.' + k, place);
+      }
+    }
+  };
+  const nodes = Array.isArray(root?.nodes) ? root.nodes.filter(n => n && typeof n === 'object') : [];
+  for (const n of nodes) walk({ parameters: n.parameters, notes: n.notes }, '', String(n.name || 'unnamed node'));
+  if (root?.pinData) walk(root.pinData, 'pinData', 'Pinned test data');
+  if (root?.staticData) walk(root.staticData, 'staticData', 'Static data');
   return hits;
+}
+export function scanSecrets(workflow) {
+  return findSecrets(workflow).map(h => ({ node: h.place, pattern: h.pattern, length: h.length }));
+}
+
+// A copy of the workflow that is safe to show a language model: secrets blanked by key and by value,
+// pinned and static data dropped, free text clipped.
+export function redactWorkflow(wf) {
+  const clip = s => (s.length > 120 ? s.slice(0, 120) + '…' : s);
+  const scrub = (v, key = '') => {
+    if (v == null) return v;
+    if (typeof v === 'string') {
+      if (SECRET_KEY.test(key) && !isExpr(v)) return '[REDACTED]';
+      if (/^\s*[{[]/.test(v)) { try { return clip(JSON.stringify(scrub(JSON.parse(v)))); } catch {} }
+      let out = v; for (const [, re] of SECRET_VALUE) out = out.replace(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'), '[REDACTED]');
+      return clip(out);
+    }
+    if (Array.isArray(v)) return v.map(x => scrub(x, key));
+    if (typeof v === 'object') {
+      const o = {};
+      const pairSecret = typeof v.name === 'string' && SECRET_KEY.test(v.name.trim());
+      for (const [k, x] of Object.entries(v)) o[k] = pairSecret && k === 'value' ? '[REDACTED]' : scrub(x, k);
+      return o;
+    }
+    return v;
+  };
+  const { pinData, staticData, ...rest } = wf || {};
+  const out = scrub(rest);
+  out.nodes = (Array.isArray(rest.nodes) ? rest.nodes : []).filter(n => n && typeof n === 'object').map(n => scrub(n));
+  return out;
 }
 
 export function reconcile(world, state, config) {
@@ -160,12 +220,12 @@ export function detect(world, workflow, config) {
 // Workflow audit: static checks on an exported n8n workflow. Works on any workflow file.
 export function lintWorkflow(wf) {
   const out = [];
-  const nodes = Array.isArray(wf?.nodes) ? wf.nodes : [];
+  const nodes = Array.isArray(wf?.nodes) ? wf.nodes.filter(n => n && typeof n === 'object') : [];
   const txt = n => JSON.stringify(n.parameters || {});
-  for (const s of scanSecrets({ nodes })) out.push({ id: 'secret', sev: 'high', node: s.node, title: 'Secret stored in plain text', detail: `${s.pattern} in "${s.node}" (${s.length} characters). Anyone who can open or export the workflow can read it.`, fix: "Move it to n8n's credential store and reference the credential." });
+  for (const s of scanSecrets(wf || {})) out.push({ id: 'secret', sev: 'high', node: s.node, title: 'Secret stored in plain text', detail: `${s.pattern} in "${s.node}" (${s.length} characters). Anyone who can open or export the workflow can read it.`, fix: "Move it to n8n's credential store and reference the credential." });
   for (const n of nodes) {
     const t = txt(n), type = String(n.type || '');
-    if (type.endsWith('.limit')) out.push({ id: 'limit', sev: /test|debug|temp|remove/i.test(n.notes || '') ? 'high' : 'medium', node: n.name, title: `Limit node caps every run at ${n.parameters?.maxItems ?? '?'} items`, detail: `Records past the cap are dropped without an error.${n.notes ? ` Node note: "${String(n.notes).slice(0, 80)}".` : ''}`, fix: 'Remove the node, or paginate and process every batch.' });
+    if (type.endsWith('.limit')) out.push({ id: 'limit', sev: /test|debug|temp|remove/i.test(String(n.notes || '')) ? 'high' : 'medium', node: n.name, title: `Limit node caps every run at ${Number(n.parameters?.maxItems) || '?'} items`, detail: `Records past the cap are dropped without an error.${n.notes ? ` Node note: "${String(n.notes).slice(0, 80)}".` : ''}`, fix: 'Remove the node, or paginate and process every batch.' });
     if (/CreatedDateTime|createdDateTime|created_at/.test(t) && /(ge|gt|>=|>)\s*\d{4}-\d{2}-\d{2}/.test(t)) out.push({ id: 'filter', sev: 'high', node: n.name, title: 'Query filters on creation date with a fixed value', detail: 'Edits to existing records change the modified date, not the created date, so they are never fetched again.', fix: 'Filter on the modified date since the last successful run.' });
     else if (/\$filter|updated_at_min|modified/i.test(t) && /\d{4}-\d{2}-\d{2}T/.test(t) && !/\{\{/.test(t)) out.push({ id: 'fixeddate', sev: 'medium', node: n.name, title: 'Date filter is a fixed value', detail: 'A hard-coded date never moves forward, so the window grows or stays wrong.', fix: 'Use an expression based on the last run time.' });
     if (n.onError === 'continueRegularOutput' || n.continueOnFail === true) out.push({ id: 'swallow', sev: 'high', node: n.name, title: 'Errors are passed on as success', detail: `"${n.name}" continues on error, so a failed update still ends the run green.`, fix: 'Use "Continue (using error output)" and route failures to an alert, or stop the workflow.' });
@@ -183,23 +243,27 @@ export function lintWorkflow(wf) {
 
 // Reconciliation for real exports: ERP products vs store products, and optionally orders.
 export function reconcileFiles({ erp = [], shop = [], shopOrders = [], erpOrders = [] }) {
-  const byShop = new Map(shop.map(r => [r.sku, r]));
-  const byErp = new Map(erp.map(r => [r.sku, r]));
-  const missingInShop = erp.filter(r => r.sku && !byShop.has(r.sku));
-  const missingInErp = shop.filter(r => r.sku && !byErp.has(r.sku));
-  const priceDrift = [], stockDrift = [];
-  for (const e of erp) {
+  const key = v => String(v ?? '').trim().toUpperCase();
+  const index = rows => { const m = new Map(), dup = new Set(); for (const r of rows) { const k = key(r.sku); if (!k) continue; if (m.has(k)) dup.add(k); m.set(k, { ...r, sku: k }); } return [m, [...dup]]; };
+  const [byErp, dupErp] = index(erp), [byShop, dupShop] = index(shop);
+  const missingInShop = [...byErp.values()].filter(r => !byShop.has(r.sku));
+  const missingInErp = [...byShop.values()].filter(r => !byErp.has(r.sku));
+  const priceDrift = [], stockDrift = [], unreadable = [];
+  for (const e of byErp.values()) {
     const s = byShop.get(e.sku); if (!s) continue;
+    if ((e.price == null) !== (s.price == null)) unreadable.push(e.sku);
     if (e.price != null && s.price != null && Math.abs(e.price - s.price) > 0.004) priceDrift.push({ sku: e.sku, name: e.name || s.name, erp: e.price, shop: s.price });
     if (e.stock != null && s.stock != null && e.stock !== s.stock) stockDrift.push({ sku: e.sku, name: e.name || s.name, erp: e.stock, shop: s.stock });
   }
   const oversell = stockDrift.filter(d => d.shop > d.erp);
-  const refs = new Set(erpOrders.map(o => String(o.ref).replace(/^#/, '')));
-  const unbooked = shopOrders.filter(o => o.id && !refs.has(String(o.id).replace(/^#/, '')));
-  return { erpCount: erp.length, shopCount: shop.length, missingInShop, missingInErp, priceDrift, stockDrift,
+  // Shopify order exports have one row per line item: one order, many rows.
+  const orders = new Map(); for (const o of shopOrders) { const k = key(o.id).replace(/^#/, ''); if (k && !orders.has(k)) orders.set(k, o); }
+  const refs = new Set(erpOrders.map(o => key(o.ref).replace(/^#/, '')));
+  const unbooked = [...orders.entries()].filter(([k]) => !refs.has(k)).map(([, o]) => o);
+  return { erpCount: byErp.size, shopCount: byShop.size, missingInShop, missingInErp, priceDrift, stockDrift, duplicates: { erp: dupErp, shop: dupShop }, unreadable,
     oversellSkus: oversell.length, oversellUnits: oversell.reduce((a, d) => a + d.shop - d.erp, 0),
     oversellValue: oversell.reduce((a, d) => a + (d.shop - d.erp) * (byErp.get(d.sku).price || 0), 0),
-    orders: shopOrders.length, unbooked, unbookedValue: unbooked.reduce((a, o) => a + (o.total || 0), 0) };
+    orders: orders.size, unbooked, unbookedValue: unbooked.reduce((a, o) => a + (o.total || 0), 0) };
 }
 
 export const aed = v => 'AED ' + Math.round(v).toLocaleString('en-US');

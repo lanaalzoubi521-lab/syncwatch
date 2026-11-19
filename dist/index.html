@@ -433,7 +433,7 @@ function parseCSV(text, delim = detectDelimiter(text)) {
       if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
       else if (c === '"') q = false;
       else cell += c;
-    } else if (c === '"') q = true;
+    } else if (c === '"' && cell === '') q = true; // a quote opens a quoted cell only at its start; 12" stays literal
     else if (c === delim) { row.push(cell); cell = ''; }
     else if (c === '\n' || c === '\r') {
       if (c === '\r' && text[i + 1] === '\n') i++;
@@ -452,7 +452,7 @@ function parseCSV(text, delim = detectDelimiter(text)) {
 
 const AR_DIGITS = '٠١٢٣٤٥٦٧٨٩';
 function normalizeNumber(v) {
-  let s = String(v ?? '').trim().replace(/[٠-٩]/g, d => AR_DIGITS.indexOf(d)).replace(/[\s ]/g, '');
+  let s = String(v ?? '').trim().replace(/[٠-٩]/g, d => AR_DIGITS.indexOf(d)).replace(/^(aed|dhs?|usd|sar|\$|د\.إ|درهم)\s*/i, '').replace(/\s*(aed|dhs?|usd|sar|درهم)$/i, '').replace(/[\s ]/g, '');
   if (!s) return '';
   if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, '');          // 1,234.50
   else if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) s = s.replace(/\./g, '').replace(',', '.'); // 1.234,50
@@ -463,7 +463,7 @@ function normalizeNumber(v) {
 // CSV out. Cells that a spreadsheet would run as a formula are neutralised.
 function safeCell(v) {
   let s = String(v ?? '');
-  if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = "'" + s;
+  if (/^\s*[=+\-@\t\r＝＋－＠]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = "'" + s;
   return /[",\n\r;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
@@ -617,13 +617,73 @@ function replay(world, config) {
   return { shop, runs, orders };
 }
 
-function scanSecrets(workflow) {
+// Secret scan over the whole workflow: every node (parameters, notes, headers, bodies, JSON strings
+// inside parameters) and pinned data. Reports type, place and length; never any part of the value.
+const SECRET_KEY = /^(authorization|x-api-key|api[-_]?key|apikey|access[-_]?token|refresh[-_]?token|token|secret|client[-_]?secret|password|passwd|pwd|private[-_]?key)$/i;
+const SECRET_VALUE = [
+  ['Bearer token', /\bbearer\s+[A-Za-z0-9\-_.=]{16,}/i],
+  ['Basic auth credentials', /\bbasic\s+[A-Za-z0-9+/=]{12,}/i],
+  ['Shopify access token', /\bshpat_[a-f0-9]{16,}/i],
+  ['API key', /\b(sk|pk|rk)[-_](live|test|proj)?[-_]?[A-Za-z0-9]{16,}/],
+  ['JSON web token', /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/],
+];
+const isExpr = v => /^=|\{\{/.test(v);
+function findSecrets(root) {
   const hits = [];
-  for (const node of workflow.nodes) {
-    const text = JSON.stringify(node.parameters);
-    for (const p of SECRET_PATTERNS) if (p.re.test(text)) hits.push({ node: node.name, pattern: p.name, length: text.match(p.re)[0].length }); // never echo any part of a secret
-  }
+  const walk = (v, path, place) => {
+    if (v == null) return;
+    if (typeof v === 'string') {
+      if (/^\s*[{[]/.test(v)) { try { walk(JSON.parse(v), path, place); } catch {} }
+      for (const [name, re] of SECRET_VALUE) { const m = v.match(re); if (m && !isExpr(v)) { hits.push({ place, path, pattern: name, length: m[0].length }); return; } }
+      return;
+    }
+    if (Array.isArray(v)) { v.forEach((x, i) => walk(x, path + '[' + i + ']', place)); return; }
+    if (typeof v === 'object') {
+      // {name: 'Authorization', value: '...'} pairs, as n8n stores headers and query parameters
+      const pair = typeof v.name === 'string' && typeof v.value === 'string' && SECRET_KEY.test(v.name.trim()) && v.value.length >= 8 && !isExpr(v.value);
+      if (pair) hits.push({ place, path: path + '.' + v.name, pattern: (SECRET_VALUE.find(([, re]) => re.test(v.value)) || [`Value of "${v.name}"`])[0], length: v.value.length });
+      for (const [k, x] of Object.entries(v)) {
+        if (pair && k === 'value') continue;
+        if (typeof x === 'string' && SECRET_KEY.test(k) && x.length >= 8 && !isExpr(x) && !SECRET_VALUE.some(([, re]) => re.test(x))) hits.push({ place, path: path + '.' + k, pattern: `Value of "${k}"`, length: x.length });
+        else walk(x, path + '.' + k, place);
+      }
+    }
+  };
+  const nodes = Array.isArray(root?.nodes) ? root.nodes.filter(n => n && typeof n === 'object') : [];
+  for (const n of nodes) walk({ parameters: n.parameters, notes: n.notes }, '', String(n.name || 'unnamed node'));
+  if (root?.pinData) walk(root.pinData, 'pinData', 'Pinned test data');
+  if (root?.staticData) walk(root.staticData, 'staticData', 'Static data');
   return hits;
+}
+function scanSecrets(workflow) {
+  return findSecrets(workflow).map(h => ({ node: h.place, pattern: h.pattern, length: h.length }));
+}
+
+// A copy of the workflow that is safe to show a language model: secrets blanked by key and by value,
+// pinned and static data dropped, free text clipped.
+function redactWorkflow(wf) {
+  const clip = s => (s.length > 120 ? s.slice(0, 120) + '…' : s);
+  const scrub = (v, key = '') => {
+    if (v == null) return v;
+    if (typeof v === 'string') {
+      if (SECRET_KEY.test(key) && !isExpr(v)) return '[REDACTED]';
+      if (/^\s*[{[]/.test(v)) { try { return clip(JSON.stringify(scrub(JSON.parse(v)))); } catch {} }
+      let out = v; for (const [, re] of SECRET_VALUE) out = out.replace(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'), '[REDACTED]');
+      return clip(out);
+    }
+    if (Array.isArray(v)) return v.map(x => scrub(x, key));
+    if (typeof v === 'object') {
+      const o = {};
+      const pairSecret = typeof v.name === 'string' && SECRET_KEY.test(v.name.trim());
+      for (const [k, x] of Object.entries(v)) o[k] = pairSecret && k === 'value' ? '[REDACTED]' : scrub(x, k);
+      return o;
+    }
+    return v;
+  };
+  const { pinData, staticData, ...rest } = wf || {};
+  const out = scrub(rest);
+  out.nodes = (Array.isArray(rest.nodes) ? rest.nodes : []).filter(n => n && typeof n === 'object').map(n => scrub(n));
+  return out;
 }
 
 function reconcile(world, state, config) {
@@ -739,12 +799,12 @@ function detect(world, workflow, config) {
 // Workflow audit: static checks on an exported n8n workflow. Works on any workflow file.
 function lintWorkflow(wf) {
   const out = [];
-  const nodes = Array.isArray(wf?.nodes) ? wf.nodes : [];
+  const nodes = Array.isArray(wf?.nodes) ? wf.nodes.filter(n => n && typeof n === 'object') : [];
   const txt = n => JSON.stringify(n.parameters || {});
-  for (const s of scanSecrets({ nodes })) out.push({ id: 'secret', sev: 'high', node: s.node, title: 'Secret stored in plain text', detail: `${s.pattern} in "${s.node}" (${s.length} characters). Anyone who can open or export the workflow can read it.`, fix: "Move it to n8n's credential store and reference the credential." });
+  for (const s of scanSecrets(wf || {})) out.push({ id: 'secret', sev: 'high', node: s.node, title: 'Secret stored in plain text', detail: `${s.pattern} in "${s.node}" (${s.length} characters). Anyone who can open or export the workflow can read it.`, fix: "Move it to n8n's credential store and reference the credential." });
   for (const n of nodes) {
     const t = txt(n), type = String(n.type || '');
-    if (type.endsWith('.limit')) out.push({ id: 'limit', sev: /test|debug|temp|remove/i.test(n.notes || '') ? 'high' : 'medium', node: n.name, title: `Limit node caps every run at ${n.parameters?.maxItems ?? '?'} items`, detail: `Records past the cap are dropped without an error.${n.notes ? ` Node note: "${String(n.notes).slice(0, 80)}".` : ''}`, fix: 'Remove the node, or paginate and process every batch.' });
+    if (type.endsWith('.limit')) out.push({ id: 'limit', sev: /test|debug|temp|remove/i.test(String(n.notes || '')) ? 'high' : 'medium', node: n.name, title: `Limit node caps every run at ${Number(n.parameters?.maxItems) || '?'} items`, detail: `Records past the cap are dropped without an error.${n.notes ? ` Node note: "${String(n.notes).slice(0, 80)}".` : ''}`, fix: 'Remove the node, or paginate and process every batch.' });
     if (/CreatedDateTime|createdDateTime|created_at/.test(t) && /(ge|gt|>=|>)\s*\d{4}-\d{2}-\d{2}/.test(t)) out.push({ id: 'filter', sev: 'high', node: n.name, title: 'Query filters on creation date with a fixed value', detail: 'Edits to existing records change the modified date, not the created date, so they are never fetched again.', fix: 'Filter on the modified date since the last successful run.' });
     else if (/\$filter|updated_at_min|modified/i.test(t) && /\d{4}-\d{2}-\d{2}T/.test(t) && !/\{\{/.test(t)) out.push({ id: 'fixeddate', sev: 'medium', node: n.name, title: 'Date filter is a fixed value', detail: 'A hard-coded date never moves forward, so the window grows or stays wrong.', fix: 'Use an expression based on the last run time.' });
     if (n.onError === 'continueRegularOutput' || n.continueOnFail === true) out.push({ id: 'swallow', sev: 'high', node: n.name, title: 'Errors are passed on as success', detail: `"${n.name}" continues on error, so a failed update still ends the run green.`, fix: 'Use "Continue (using error output)" and route failures to an alert, or stop the workflow.' });
@@ -762,23 +822,27 @@ function lintWorkflow(wf) {
 
 // Reconciliation for real exports: ERP products vs store products, and optionally orders.
 function reconcileFiles({ erp = [], shop = [], shopOrders = [], erpOrders = [] }) {
-  const byShop = new Map(shop.map(r => [r.sku, r]));
-  const byErp = new Map(erp.map(r => [r.sku, r]));
-  const missingInShop = erp.filter(r => r.sku && !byShop.has(r.sku));
-  const missingInErp = shop.filter(r => r.sku && !byErp.has(r.sku));
-  const priceDrift = [], stockDrift = [];
-  for (const e of erp) {
+  const key = v => String(v ?? '').trim().toUpperCase();
+  const index = rows => { const m = new Map(), dup = new Set(); for (const r of rows) { const k = key(r.sku); if (!k) continue; if (m.has(k)) dup.add(k); m.set(k, { ...r, sku: k }); } return [m, [...dup]]; };
+  const [byErp, dupErp] = index(erp), [byShop, dupShop] = index(shop);
+  const missingInShop = [...byErp.values()].filter(r => !byShop.has(r.sku));
+  const missingInErp = [...byShop.values()].filter(r => !byErp.has(r.sku));
+  const priceDrift = [], stockDrift = [], unreadable = [];
+  for (const e of byErp.values()) {
     const s = byShop.get(e.sku); if (!s) continue;
+    if ((e.price == null) !== (s.price == null)) unreadable.push(e.sku);
     if (e.price != null && s.price != null && Math.abs(e.price - s.price) > 0.004) priceDrift.push({ sku: e.sku, name: e.name || s.name, erp: e.price, shop: s.price });
     if (e.stock != null && s.stock != null && e.stock !== s.stock) stockDrift.push({ sku: e.sku, name: e.name || s.name, erp: e.stock, shop: s.stock });
   }
   const oversell = stockDrift.filter(d => d.shop > d.erp);
-  const refs = new Set(erpOrders.map(o => String(o.ref).replace(/^#/, '')));
-  const unbooked = shopOrders.filter(o => o.id && !refs.has(String(o.id).replace(/^#/, '')));
-  return { erpCount: erp.length, shopCount: shop.length, missingInShop, missingInErp, priceDrift, stockDrift,
+  // Shopify order exports have one row per line item: one order, many rows.
+  const orders = new Map(); for (const o of shopOrders) { const k = key(o.id).replace(/^#/, ''); if (k && !orders.has(k)) orders.set(k, o); }
+  const refs = new Set(erpOrders.map(o => key(o.ref).replace(/^#/, '')));
+  const unbooked = [...orders.entries()].filter(([k]) => !refs.has(k)).map(([, o]) => o);
+  return { erpCount: byErp.size, shopCount: byShop.size, missingInShop, missingInErp, priceDrift, stockDrift, duplicates: { erp: dupErp, shop: dupShop }, unreadable,
     oversellSkus: oversell.length, oversellUnits: oversell.reduce((a, d) => a + d.shop - d.erp, 0),
     oversellValue: oversell.reduce((a, d) => a + (d.shop - d.erp) * (byErp.get(d.sku).price || 0), 0),
-    orders: shopOrders.length, unbooked, unbookedValue: unbooked.reduce((a, o) => a + (o.total || 0), 0) };
+    orders: orders.size, unbooked, unbookedValue: unbooked.reduce((a, o) => a + (o.total || 0), 0) };
 }
 
 const aed = v => 'AED ' + Math.round(v).toLocaleString('en-US');
@@ -789,7 +853,8 @@ const aed = v => 'AED ' + Math.round(v).toLocaleString('en-US');
 // fixes go through human approval in the UI.
 
 const clip = (v, n = 80) => (typeof v === 'string' ? v.slice(0, n) : v);
-const redact = s => s.replace(/Bearer\s+[A-Za-z0-9\-_.]+/g, 'Bearer [REDACTED]').replace(/shpat_[a-f0-9]+/g, 'shpat_[REDACTED]');
+
+
 
 // ctx: { runLog: object|null, systems: object, workflow: object|null, audit: [], product: sku => object|null }
 function agentTools(ctx) {
@@ -799,7 +864,7 @@ function agentTools(ctx) {
     { name: 'compare_systems', description: 'Reconciles the ERP with the store: product counts, products missing on either side, price and stock differences with examples, and store orders vs ERP sales orders.',
       execute: () => JSON.parse(JSON.stringify(ctx.systems, (k, v) => clip(v))) },
     { name: 'get_workflow', description: 'The n8n workflow (secrets redacted) and the static audit findings for it. Returns available:false if no workflow file was provided.',
-      execute: () => ctx.workflow ? { workflow: JSON.parse(redact(JSON.stringify(ctx.workflow))), audit: ctx.audit.map(a => ({ title: a.title, node: a.node, severity: a.sev })) } : { available: false } },
+      execute: () => ctx.workflow ? { workflow: redactWorkflow(ctx.workflow), audit: ctx.audit.map(a => ({ title: a.title, node: clip(String(a.node || ''), 60), severity: a.sev })) } : { available: false } },
     { name: 'get_product', description: 'One product by SKU as the ERP and the store each hold it.',
       inputSchema: { type: 'object', properties: { sku: { type: 'string' } }, required: ['sku'] },
       execute: ({ sku }) => { const p = ctx.product(String(sku).slice(0, 64)); if (!p) throw new Error('No such SKU'); return JSON.parse(JSON.stringify(p, (k, v) => clip(v))); } },
@@ -879,6 +944,9 @@ function compute() {
     if (driftN) inc.push({ id: 'drift', kind: 'incident', sev: 'high', title: `${driftN} products show a different price or stock`, lede: 'The store and the ERP disagree on these products.', cause: cause(['filter', 'fixeddate', 'swallow'], 'Upload the workflow file to find the cause.'), evidence: [['Price differs', fmt(rec.priceDrift.length)], ['Stock differs', fmt(rec.stockDrift.length)], ['Store shows more stock than the ERP', `${fmt(rec.oversellUnits)} units on ${fmt(rec.oversellSkus)} products`]], sample: rec.priceDrift.slice(0, 6).map(d => [d.sku, d.name || '', `${d.shop} in store · ${d.erp} in ERP`]), fix: { label: has('filter')?.fix || has('fixeddate')?.fix || has('swallow')?.fix || 'Fetch every record modified since the last run.' } });
     if (rec.unbooked.length) inc.push({ id: 'orders', kind: 'incident', sev: 'high', title: `${rec.unbooked.length} store orders have no ERP sales order`, lede: 'These orders exist in the store export and are missing from the ERP sales orders.', cause: cause(['writeback'], 'No matching reference found in the ERP export.'), evidence: [['Store orders', fmt(rec.orders)], ['Without an ERP sales order', fmt(rec.unbooked.length)]], sample: rec.unbooked.slice(0, 6).map(o => [String(o.id), o.total != null ? String(o.total) : '', 'no ERP order']), fix: { label: has('writeback')?.fix || 'Create an ERP sales order for each store order.' } });
     if (rec.missingInErp.length) inc.push({ id: 'orphans', kind: 'incident', sev: 'medium', title: `${rec.missingInErp.length} store products do not exist in the ERP`, lede: 'Sold online but unknown to finance and the warehouse.', cause: 'Products created directly in the store, or SKUs changed in one system only.', evidence: [['Store-only products', fmt(rec.missingInErp.length)]], sample: rec.missingInErp.slice(0, 6).map(p => [p.sku, p.name || '', 'not in ERP']), fix: { label: 'Create them in the ERP or retire them from the store.' } });
+    const dups = [...new Set([...rec.duplicates.erp, ...rec.duplicates.shop])];
+    if (dups.length) inc.push({ id: 'dups', kind: 'incident', sev: 'medium', title: `${dups.length} SKUs appear more than once`, lede: 'The same SKU is on several rows of an export. Only the last row was compared, so these results may hide differences.', cause: 'Variants or duplicate records sharing one SKU.', evidence: [['In ERP export', fmt(rec.duplicates.erp.length)], ['In store export', fmt(rec.duplicates.shop.length)]], sample: dups.slice(0, 6).map(k => [k, '', 'duplicate']), fix: { label: 'Give every variant its own SKU, then export again.' } });
+    if (rec.unreadable.length) inc.push({ id: 'unread', kind: 'incident', sev: 'medium', title: `${rec.unreadable.length} prices could not be read`, lede: 'A price is present on one side but not readable as a number, so drift could not be checked.', cause: 'Text in a price column.', evidence: [['Products affected', fmt(rec.unreadable.length)]], sample: rec.unreadable.slice(0, 6).map(k => [k, '', 'price not a number']), fix: { label: 'Export prices as plain numbers.' } });
     for (const a of S.audit) inc.push({ id: 'lint-' + a.id + a.node, kind: 'risk', sev: a.sev, title: a.title, lede: a.detail, cause: a.detail, evidence: [['Node', a.node || 'Workflow settings'], ['Severity', a.sev]], sample: [], fix: { label: a.fix } });
     S.incidents = inc.filter(i => !S.resolved.has(i.id));
   }

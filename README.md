@@ -40,7 +40,7 @@ These are the same four classes of issue found in a real production review of a 
 No dependencies. Node 18 or later.
 
 ```bash
-npm test          # 20 tests: replay, detectors, workflow audit, real exports, secret handling, the n8n monitor
+npm test          # 26 tests: replay, detectors, workflow audit, real exports, secret handling, the n8n monitor
 npm run build     # writes dist/index.html, one self-contained file
 ```
 

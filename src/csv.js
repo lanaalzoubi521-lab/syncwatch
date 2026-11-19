@@ -27,7 +27,7 @@ export function parseCSV(text, delim = detectDelimiter(text)) {
       if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
       else if (c === '"') q = false;
       else cell += c;
-    } else if (c === '"') q = true;
+    } else if (c === '"' && cell === '') q = true; // a quote opens a quoted cell only at its start; 12" stays literal
     else if (c === delim) { row.push(cell); cell = ''; }
     else if (c === '\n' || c === '\r') {
       if (c === '\r' && text[i + 1] === '\n') i++;
@@ -46,7 +46,7 @@ export function parseCSV(text, delim = detectDelimiter(text)) {
 
 const AR_DIGITS = '٠١٢٣٤٥٦٧٨٩';
 export function normalizeNumber(v) {
-  let s = String(v ?? '').trim().replace(/[٠-٩]/g, d => AR_DIGITS.indexOf(d)).replace(/[\s ]/g, '');
+  let s = String(v ?? '').trim().replace(/[٠-٩]/g, d => AR_DIGITS.indexOf(d)).replace(/^(aed|dhs?|usd|sar|\$|د\.إ|درهم)\s*/i, '').replace(/\s*(aed|dhs?|usd|sar|درهم)$/i, '').replace(/[\s ]/g, '');
   if (!s) return '';
   if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, '');          // 1,234.50
   else if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) s = s.replace(/\./g, '').replace(',', '.'); // 1.234,50
@@ -57,7 +57,7 @@ export function normalizeNumber(v) {
 // CSV out. Cells that a spreadsheet would run as a formula are neutralised.
 export function safeCell(v) {
   let s = String(v ?? '');
-  if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = "'" + s;
+  if (/^\s*[=+\-@\t\r＝＋－＠]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = "'" + s;
   return /[",\n\r;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
