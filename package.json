@@ -1,1 +1,33 @@
-{"name":"syncwatch","version":"1.0.0","type":"module","scripts":{"test":"node --test test/*.test.js","build":"node scripts/build.js"},"license":"MIT"}
+{
+  "name": "syncwatch",
+  "version": "1.0.0",
+  "description": "Silent-failure monitor for ERP to e-commerce syncs (Dynamics 365 to Shopify via n8n): reconciles both systems, audits the workflow and explains drift with a grounded AI agent.",
+  "keywords": [
+    "n8n",
+    "dynamics-365",
+    "shopify",
+    "integration",
+    "data-reconciliation",
+    "ai-agent",
+    "monitoring",
+    "automation"
+  ],
+  "homepage": "https://lanaalzoubi521-lab.github.io/syncwatch/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lanaalzoubi521-lab/syncwatch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lanaalzoubi521-lab/syncwatch/issues"
+  },
+  "author": "Lana Alzoubi (https://lanaalzoubi.com)",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build": "node scripts/build.js"
+  }
+}

@@ -5,6 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SyncWatch</title>
 <meta name="description" content="Finds the ERP to e-commerce sync failures that never show up as errors.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="SyncWatch">
+<meta property="og:description" content="Your integration says Success. SyncWatch checks whether the data in both systems agrees.">
+<meta property="og:url" content="https://lanaalzoubi521-lab.github.io/syncwatch/">
+<meta property="og:image" content="https://lanaalzoubi521-lab.github.io/syncwatch/overview.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="author" content="Lana Alzoubi">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2322C55E'/><circle cx='16' cy='16' r='6' fill='white'/></svg>">
 <style>
 /*FONTS*/
 
@@ -281,7 +289,7 @@ textarea:focus{border-color:var(--acc)}
               <li><code>compare_systems</code>Products, prices, stock and orders, ERP against store.</li>
               <li><code>get_workflow</code>The workflow with secrets redacted, and its audit.</li>
               <li><code>get_product</code>One SKU as each system holds it.</li></ul>
-              <p class="fine" style="padding:0 16px 14px">The live agent runs when this page is opened inside Claude.</p></div>
+              <p class="fine" style="padding:0 16px 14px">This public demo runs without a language model, so the agent is switched off here. Its tools, prompt and safeguards are in <code>src/agent.js</code>.</p></div>
           </div>
           <div class="card agent-only"><ul id="a-steps"></ul><div id="a-out"></div></div>
         </div>
