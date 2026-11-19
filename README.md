@@ -23,18 +23,24 @@ These are the same four classes of issue found in a real production review of a 
 
 ## How it works
 
-**Detectors look only at evidence a monitor can actually see:** the run log, the two systems, and the exported workflow JSON. Each detector needs a pattern, not a single symptom. The date-filter detector, for example, only fires when more than 90% of drifted products were created before go-live and edited after it.
+**Two kinds of finding.** *Data incidents* are proven by comparing both systems record by record. *Workflow risks* come from auditing the n8n workflow file. When both exist, each incident is linked to the workflow setting that causes it.
 
-**Fixes are replayed, not assumed.** Approving a fix changes the workflow configuration, replays every scheduled run since go-live, and reconciles again. When one fix also clears another finding, SyncWatch says so. Every approval is logged.
+**Workflow audit** (works on any exported n8n workflow): plain-text secrets, Limit nodes, filters on creation date or fixed dates, nodes that pass errors on as success, OData reads without pagination, HTTP calls without retry, one-way flows with no write-back, and workflows with no error alert.
 
-**An investigation agent** (when the page runs inside Claude) takes a symptom in plain words, such as *"customers see old prices"*, and works it out with four read-only tools: `get_run_log`, `compare_systems`, `get_workflow`, and `get_product`. It reports causes with the numbers it found. It cannot change anything. Changes go through the human approval step.
+**Your own data.** Drop in an ERP product export and a Shopify product export (and optionally the n8n workflow, Shopify orders and ERP sales orders). Column names from Dynamics 365 F&O and Shopify exports are recognised. Sample export files are downloadable from the app to try the flow.
+
+**Fixes are replayed, not assumed** (demo). Approving a fix changes the workflow configuration, replays every scheduled run since go-live, and reconciles again. When one fix also clears another finding, SyncWatch says so. Every approval is logged.
+
+**Investigation agent** (when the page runs inside Claude): takes a symptom in plain words, such as *"customers see old prices"*, and works it out with four read-only tools: `get_run_log`, `compare_systems`, `get_workflow`, `get_product`. It reports causes with the numbers it found and changes nothing. Customer data reaches it only inside tool results, which it is instructed to treat as data. See [SECURITY.md](SECURITY.md).
+
+**Daily monitor for n8n.** [`n8n/syncwatch-daily-check.json`](n8n/syncwatch-daily-check.json) is an importable workflow that runs the core check every morning: reads every ERP product page by page, reads every Shopify product, compares SKUs and prices, and emails the team when they differ. Set your ERP URL, credentials and email addresses; the field names are at the top of the Compare node. Its comparison logic is covered by the test suite.
 
 ## Run it
 
 No dependencies. Node 18 or later.
 
 ```bash
-npm test          # 8 engine tests
+npm test          # 20 tests: replay, detectors, workflow audit, real exports, secret handling, the n8n monitor
 npm run build     # writes dist/index.html, one self-contained file
 ```
 
@@ -42,9 +48,11 @@ npm run build     # writes dist/index.html, one self-contained file
 
 ```
 src/data.js     demo world: ERP products, Shopify state at go-live, orders, schedule, workflow JSON
-src/engine.js   replay, reconciliation, the four detectors, secret scanning
+src/csv.js      file import: encodings, delimiters, number formats, column recognition
+src/engine.js   replay, reconciliation, detectors, workflow audit, secret scanning
 src/agent.js    agent tools and prompt
 src/app.js      interface
+n8n/            importable daily monitor workflow and its Compare code
 test/           node:test suite
 ```
 

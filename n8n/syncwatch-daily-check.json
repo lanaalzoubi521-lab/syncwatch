@@ -1,0 +1,194 @@
+{
+  "name": "SyncWatch daily check: ERP vs Shopify",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "name": "Every day at 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://YOUR-ENV.operations.dynamics.com/data/ReleasedProductsV2",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "$select",
+              "value": "ItemNumber,ProductName,SalesPrice"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "responseContainsNextURL",
+              "nextURL": "={{ $response.body[\"@odata.nextLink\"] }}",
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body[\"@odata.nextLink\"] }}"
+            }
+          }
+        }
+      },
+      "name": "Get ERP products",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "resource": "product",
+        "operation": "getAll",
+        "returnAll": true
+      },
+      "name": "Get Shopify products",
+      "type": "n8n-nodes-base.shopify",
+      "typeVersion": 1,
+      "position": [
+        440,
+        0
+      ],
+      "retryOnFail": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code node body for the daily SyncWatch check (n8n Code node, \"Run Once for All Items\").\n// Adjust the four field names to match your ERP entity.\nconst ERP_SKU = 'ItemNumber';\nconst ERP_NAME = 'ProductName';\nconst ERP_PRICE = 'SalesPrice';\nconst PRICE_TOLERANCE = 0.01;\n\nconst erpRows = $('Get ERP products').all().flatMap(i => i.json.value || [i.json]);\nconst shopVariants = $('Get Shopify products').all().flatMap(i => (i.json.variants || []).map(v => ({ sku: String(v.sku || '').trim(), price: Number(v.price), title: i.json.title })));\n\nconst shop = new Map(shopVariants.filter(v => v.sku).map(v => [v.sku, v]));\nconst erp = new Map(erpRows.map(r => [String(r[ERP_SKU] || '').trim(), r]).filter(([k]) => k));\n\nconst missingInStore = [...erp.keys()].filter(k => !shop.has(k));\nconst missingInErp = [...shop.keys()].filter(k => !erp.has(k));\nconst priceDiffs = [];\nfor (const [sku, r] of erp) {\n  const s = shop.get(sku);\n  if (s && Math.abs(Number(r[ERP_PRICE]) - s.price) > PRICE_TOLERANCE) priceDiffs.push({ sku, name: r[ERP_NAME], erp: Number(r[ERP_PRICE]), store: s.price });\n}\nconst total = missingInStore.length + missingInErp.length + priceDiffs.length;\nconst list = (title, arr, fmt) => arr.length ? `${title} (${arr.length})\\n` + arr.slice(0, 20).map(fmt).join('\\n') + (arr.length > 20 ? `\\n\u2026and ${arr.length - 20} more` : '') + '\\n\\n' : '';\n\nreturn [{ json: {\n  total,\n  erpProducts: erp.size, storeProducts: shop.size,\n  missingInStore: missingInStore.length, missingInErp: missingInErp.length, priceDiffs: priceDiffs.length,\n  subject: `SyncWatch: ${total} differences between the ERP and the store`,\n  body: `Daily check, ${new Date().toISOString().slice(0, 10)}\\nERP products: ${erp.size}\\nStore products: ${shop.size}\\n\\n`\n    + list('In the ERP, not in the store', missingInStore, s => `- ${s}`)\n    + list('In the store, not in the ERP', missingInErp, s => `- ${s}`)\n    + list('Price differs', priceDiffs, d => `- ${d.sku} ${d.name || ''}: ERP ${d.erp}, store ${d.store}`),\n} }];\n"
+      },
+      "name": "Compare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.total }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Any differences?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "alerts@your-company.com",
+        "toEmail": "ops@your-company.com",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {}
+      },
+      "name": "Email the team",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1100,
+        -80
+      ]
+    }
+  ],
+  "connections": {
+    "Every day at 06:00": {
+      "main": [
+        [
+          {
+            "node": "Get ERP products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get ERP products": {
+      "main": [
+        [
+          {
+            "node": "Get Shopify products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Shopify products": {
+      "main": [
+        [
+          {
+            "node": "Compare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compare": {
+      "main": [
+        [
+          {
+            "node": "Any differences?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any differences?": {
+      "main": [
+        [
+          {
+            "node": "Email the team",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

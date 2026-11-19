@@ -71,15 +71,17 @@ export function buildWorld() {
 export function buggyWorkflow() {
   return {
     name: 'D365 F&O to Shopify - product sync',
+    settings: {},
     nodes: [
       { name: 'Every 6 hours', type: 'n8n-nodes-base.scheduleTrigger', parameters: { rule: { interval: [{ field: 'hours', hoursInterval: 6 }] } } },
       { name: 'Get released products', type: 'n8n-nodes-base.httpRequest', parameters: {
         url: 'https://raml.operations.dynamics.com/data/ReleasedProductsV2',
         sendHeaders: true,
         headerParameters: { parameters: [{ name: 'Authorization', value: 'Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.DEMO-TOKEN-NOT-REAL' }] },
-        qs: { $filter: "CreatedDateTime ge 2026-10-01T00:00:00Z" } } },
+        sendQuery: true, queryParameters: { parameters: [{ name: '$filter', value: 'CreatedDateTime ge 2026-10-01T00:00:00Z' }] },
+        options: {} } },
       { name: 'Limit', type: 'n8n-nodes-base.limit', parameters: { maxItems: 50 }, notes: 'testing, remove before go-live' },
-      { name: 'Upsert Shopify product', type: 'n8n-nodes-base.shopify', parameters: { operation: 'upsert' } },
+      { name: 'Upsert Shopify product', type: 'n8n-nodes-base.shopify', parameters: { resource: 'product', operation: 'update' }, onError: 'continueRegularOutput' },
     ],
   };
 }

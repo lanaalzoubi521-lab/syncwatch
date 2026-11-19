@@ -22,7 +22,13 @@ export function replay(world, config) {
       else cand = world.erp.filter(p => (p.modified > last && p.modified <= t) || (p.created > last && p.created <= t));
       const batch = config.limit ? cand.slice(0, config.limit) : cand;
       for (const p of batch) shop.set(p.sku, { sku: p.sku, title: p.name, price: priceAt(p, t), inventory: t >= p.modified ? p.onHand : p._onHand0 });
-      runs.push({ at: t, fetched: cand.length, processed: batch.length, status: 'success' });
+      let drift = 0;
+      for (const p of world.erp) {
+        if (p.created > t) continue;
+        const sh = shop.get(p.sku), price = priceAt(p, t), stock = t >= p.modified ? p.onHand : p._onHand0;
+        if (!sh || sh.price !== price || sh.inventory !== stock) drift++;
+      }
+      runs.push({ at: t, fetched: cand.length, processed: batch.length, status: 'success', drift });
       last = t;
     } else {
       const lines = ev.o.lines.filter(l => shop.has(l.sku)).map(l => ({ ...l, paid: shop.get(l.sku).price }));
@@ -36,7 +42,7 @@ export function scanSecrets(workflow) {
   const hits = [];
   for (const node of workflow.nodes) {
     const text = JSON.stringify(node.parameters);
-    for (const p of SECRET_PATTERNS) if (p.re.test(text)) hits.push({ node: node.name, pattern: p.name, sample: text.match(p.re)[0].slice(0, 18) + '…' });
+    for (const p of SECRET_PATTERNS) if (p.re.test(text)) hits.push({ node: node.name, pattern: p.name, length: text.match(p.re)[0].length }); // never echo any part of a secret
   }
   return hits;
 }
@@ -141,14 +147,59 @@ export function detect(world, workflow, config) {
       id: 'secret', title: 'An ERP access token sits in plain text in the workflow',
       lede: 'Anyone who can open or export this workflow can read it. It also travels into every backup and every copy shared for support.',
       cause: `The Authorization header in "${secrets[0].node}" holds the token directly instead of using n8n's credential store.`,
-      evidence: secrets.map(s => [s.pattern, `${s.node}: ${s.sample}`]),
+      evidence: secrets.map(s => [s.pattern, `in "${s.node}", ${s.length} characters, value hidden`]),
       sample: [],
       fix: { label: 'Move the token to the credential store', apply: c => ({ ...c, secretsInline: false }),
-        before: '"value": "Bearer eyJ0eXAiOiJKV1Qi…"', after: '"authentication": "predefinedCredentialType",\n"nodeCredentialType": "microsoftDynamicsOAuth2Api"' },
+        before: '"value": "Bearer ••••••••••••"', after: '"authentication": "predefinedCredentialType",\n"nodeCredentialType": "microsoftDynamicsOAuth2Api"' },
     });
   }
 
   return { state, rec, findings, runs, errors };
+}
+
+// Workflow audit: static checks on an exported n8n workflow. Works on any workflow file.
+export function lintWorkflow(wf) {
+  const out = [];
+  const nodes = Array.isArray(wf?.nodes) ? wf.nodes : [];
+  const txt = n => JSON.stringify(n.parameters || {});
+  for (const s of scanSecrets({ nodes })) out.push({ id: 'secret', sev: 'high', node: s.node, title: 'Secret stored in plain text', detail: `${s.pattern} in "${s.node}" (${s.length} characters). Anyone who can open or export the workflow can read it.`, fix: "Move it to n8n's credential store and reference the credential." });
+  for (const n of nodes) {
+    const t = txt(n), type = String(n.type || '');
+    if (type.endsWith('.limit')) out.push({ id: 'limit', sev: /test|debug|temp|remove/i.test(n.notes || '') ? 'high' : 'medium', node: n.name, title: `Limit node caps every run at ${n.parameters?.maxItems ?? '?'} items`, detail: `Records past the cap are dropped without an error.${n.notes ? ` Node note: "${String(n.notes).slice(0, 80)}".` : ''}`, fix: 'Remove the node, or paginate and process every batch.' });
+    if (/CreatedDateTime|createdDateTime|created_at/.test(t) && /(ge|gt|>=|>)\s*\d{4}-\d{2}-\d{2}/.test(t)) out.push({ id: 'filter', sev: 'high', node: n.name, title: 'Query filters on creation date with a fixed value', detail: 'Edits to existing records change the modified date, not the created date, so they are never fetched again.', fix: 'Filter on the modified date since the last successful run.' });
+    else if (/\$filter|updated_at_min|modified/i.test(t) && /\d{4}-\d{2}-\d{2}T/.test(t) && !/\{\{/.test(t)) out.push({ id: 'fixeddate', sev: 'medium', node: n.name, title: 'Date filter is a fixed value', detail: 'A hard-coded date never moves forward, so the window grows or stays wrong.', fix: 'Use an expression based on the last run time.' });
+    if (n.onError === 'continueRegularOutput' || n.continueOnFail === true) out.push({ id: 'swallow', sev: 'high', node: n.name, title: 'Errors are passed on as success', detail: `"${n.name}" continues on error, so a failed update still ends the run green.`, fix: 'Use "Continue (using error output)" and route failures to an alert, or stop the workflow.' });
+    if (type.endsWith('.httpRequest') && /\/data\//.test(t) && !n.parameters?.options?.pagination) out.push({ id: 'paging', sev: 'medium', node: n.name, title: 'Reads only the first page of results', detail: 'OData endpoints return results in pages. Without pagination, large catalogues are cut off.', fix: 'Enable pagination on the HTTP Request node, following the @odata.nextLink.' });
+    if (type.endsWith('.httpRequest') && !n.retryOnFail) out.push({ id: 'retry', sev: 'low', node: n.name, title: 'No retry on temporary failures', detail: 'A brief timeout fails the whole run.', fix: 'Turn on Retry On Fail with a short wait.' });
+  }
+  const hasErp = nodes.some(n => /dynamics\.com|\/data\//.test(txt(n)));
+  const hasShop = nodes.some(n => /shopify/i.test(String(n.type)) || /myshopify\.com/.test(txt(n)));
+  const writesErp = nodes.some(n => /dynamics\.com|\/data\//.test(txt(n)) && /"method":"(POST|PATCH|PUT)"/.test(txt(n)));
+  if (hasErp && hasShop && !writesErp) out.push({ id: 'writeback', sev: 'high', node: '', title: 'No write-back to the ERP', detail: 'The workflow moves data one way. Store orders never become ERP sales orders.', fix: 'Add a step that creates a sales order in the ERP for each store order.' });
+  if (!wf?.settings?.errorWorkflow && !nodes.some(n => String(n.type).endsWith('.errorTrigger'))) out.push({ id: 'noalert', sev: 'medium', node: '', title: 'Failures notify nobody', detail: 'No error workflow is set, so a failed run is only visible inside n8n.', fix: 'Set an error workflow that sends an email or Slack message.' });
+  const rank = { high: 0, medium: 1, low: 2 };
+  return out.sort((a, b) => rank[a.sev] - rank[b.sev]);
+}
+
+// Reconciliation for real exports: ERP products vs store products, and optionally orders.
+export function reconcileFiles({ erp = [], shop = [], shopOrders = [], erpOrders = [] }) {
+  const byShop = new Map(shop.map(r => [r.sku, r]));
+  const byErp = new Map(erp.map(r => [r.sku, r]));
+  const missingInShop = erp.filter(r => r.sku && !byShop.has(r.sku));
+  const missingInErp = shop.filter(r => r.sku && !byErp.has(r.sku));
+  const priceDrift = [], stockDrift = [];
+  for (const e of erp) {
+    const s = byShop.get(e.sku); if (!s) continue;
+    if (e.price != null && s.price != null && Math.abs(e.price - s.price) > 0.004) priceDrift.push({ sku: e.sku, name: e.name || s.name, erp: e.price, shop: s.price });
+    if (e.stock != null && s.stock != null && e.stock !== s.stock) stockDrift.push({ sku: e.sku, name: e.name || s.name, erp: e.stock, shop: s.stock });
+  }
+  const oversell = stockDrift.filter(d => d.shop > d.erp);
+  const refs = new Set(erpOrders.map(o => String(o.ref).replace(/^#/, '')));
+  const unbooked = shopOrders.filter(o => o.id && !refs.has(String(o.id).replace(/^#/, '')));
+  return { erpCount: erp.length, shopCount: shop.length, missingInShop, missingInErp, priceDrift, stockDrift,
+    oversellSkus: oversell.length, oversellUnits: oversell.reduce((a, d) => a + d.shop - d.erp, 0),
+    oversellValue: oversell.reduce((a, d) => a + (d.shop - d.erp) * (byErp.get(d.sku).price || 0), 0),
+    orders: shopOrders.length, unbooked, unbookedValue: unbooked.reduce((a, o) => a + (o.total || 0), 0) };
 }
 
 export const aed = v => 'AED ' + Math.round(v).toLocaleString('en-US');
