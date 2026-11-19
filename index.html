@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SyncWatch</title>
+<meta name="description" content="Finds the ERP to e-commerce sync failures that never show up as errors.">
+<style>
+/*FONTS*/
+:root{--bg:#0E0E0C;--fg:#EDEBE5;--mute:#8C8A84;--line:rgba(237,235,229,.13);--acc:#6B75FF;--e:cubic-bezier(.2,.7,0,1)}
+*{margin:0;padding:0;box-sizing:border-box}
+html{background:var(--bg)}
+body{font-family:Plex,system-ui,sans-serif;color:var(--fg);font-size:17px;line-height:1.5;-webkit-font-smoothing:antialiased;min-height:100vh}
+code,pre{font-family:PlexMono,ui-monospace,monospace}
+button,textarea{font:inherit;color:inherit;background:none;border:0}
+button{cursor:pointer}
+header{position:fixed;inset:0 0 auto;display:flex;justify-content:space-between;align-items:center;padding:26px 56px;z-index:5;background:linear-gradient(var(--bg) 70%,transparent)}
+.mark{font-weight:500}.mark i{font-style:normal;color:var(--acc)}
+nav{display:flex;gap:30px;font-size:14px;color:var(--mute)}
+nav button.on{color:var(--fg)}
+.view{display:none;min-height:100vh;padding:140px 56px 80px;max-width:1360px;margin:0 auto}
+.view.on{display:block;animation:in .7s var(--e) both}
+.view.out{animation:out .4s var(--e) both}
+@keyframes in{from{opacity:0;transform:translateY(26px)}to{opacity:1;transform:none}}
+@keyframes out{to{opacity:0;transform:translateY(-20px)}}
+.k{font-size:14px;color:var(--mute);letter-spacing:.3px;margin-bottom:20px}
+/* overview */
+.split{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--fg)}
+.split>div{padding:30px 0 0}
+.split>div+div{padding-left:48px;border-left:1px solid var(--line)}
+.say{font-size:14px;color:var(--mute)}
+.huge{font-size:clamp(72px,9.5vw,148px);font-weight:500;letter-spacing:-.04em;line-height:.95;margin-top:14px}
+.huge.ok{color:var(--mute)}
+.huge.bad{color:var(--acc)}
+.huge small{display:block;font-size:22px;letter-spacing:0;font-weight:400;color:var(--fg);margin-top:16px;line-height:1.35;max-width:28ch}
+.recon{display:grid;grid-template-columns:repeat(3,1fr);gap:40px;margin:56px 0 70px;padding-top:24px;border-top:1px solid var(--line)}
+.recon div{font-size:14px;color:var(--mute)}
+.recon b{display:block;font-size:34px;font-weight:500;color:var(--fg);letter-spacing:-.01em;margin-bottom:4px}
+.recon b span+span::before{content:" / ";color:var(--mute)}
+#findings{list-style:none;border-top:1px solid var(--fg)}
+#findings li{animation:in .8s var(--e) both;animation-delay:var(--d)}
+#findings button,#findings .ok{display:grid;grid-template-columns:80px 1fr auto;gap:24px;width:100%;text-align:left;padding:30px 0;border-bottom:1px solid var(--line);transition:padding .5s var(--e)}
+#findings button:hover{padding-left:14px}
+#findings button:hover .ar{color:var(--acc)}
+.no{font-family:PlexMono;font-size:14px;color:var(--acc);padding-top:6px}
+.t b{display:block;font-size:24px;font-weight:500;letter-spacing:-.01em;line-height:1.25}
+.t span{display:block;color:#BDBBB4;margin-top:8px;max-width:62ch}
+.ar{font-size:14px;color:var(--mute);padding-top:8px;transition:color .3s}
+.foot{display:flex;justify-content:space-between;align-items:center;margin-top:40px;font-size:14px;color:var(--mute);gap:20px;flex-wrap:wrap}
+.foot button{border-bottom:1px solid currentColor;padding-bottom:3px}
+.foot button:hover{color:var(--fg)}
+.cta{color:var(--fg)!important}
+#logwrap{margin-top:56px}
+#log{list-style:none;font-size:14px;color:#BDBBB4;border-top:1px solid var(--line)}
+#log li{display:grid;grid-template-columns:170px 1fr;gap:20px;padding:12px 0;border-bottom:1px solid var(--line)}
+#log code{color:var(--mute)}
+/* finding */
+.back{font-size:14px;color:var(--mute);margin-bottom:40px;display:inline-block}
+.back:hover{color:var(--fg)}
+.fgrid{display:grid;grid-template-columns:1.05fr 1fr;gap:90px}
+.fgrid>div{min-width:0}
+h2{font-size:clamp(36px,4.6vw,66px);font-weight:500;letter-spacing:-.02em;line-height:1.04}
+.lede{font-size:21px;font-weight:300;line-height:1.45;color:#D2D0C9;margin-top:22px;max-width:40ch}
+dl{margin-top:44px;border-top:1px solid var(--fg)}
+dl div{display:grid;grid-template-columns:1fr auto;gap:20px;padding:16px 0;border-bottom:1px solid var(--line)}
+dt{color:#BDBBB4}
+dd{font-weight:500;text-align:right}
+.cause{margin-top:40px;font-size:18px;line-height:1.5}
+.cause em{display:block;font-style:normal;font-size:14px;color:var(--mute);margin-bottom:8px}
+#f-sample{list-style:none;font-size:14px;margin-top:12px;border-top:1px solid var(--line)}
+#f-sample li{display:grid;grid-template-columns:100px 1fr auto;gap:16px;padding:11px 0;border-bottom:1px solid var(--line);color:#BDBBB4}
+#f-sample li span:first-child{font-family:PlexMono;color:var(--fg);font-size:13px}
+.diff{margin-top:14px}
+.diff pre{font-size:13px;line-height:1.7;padding:20px 22px;white-space:pre-wrap;word-break:break-word}
+.diff .b{background:rgba(237,235,229,.05);color:var(--mute);text-decoration:line-through;text-decoration-color:rgba(237,235,229,.25)}
+.diff .a{background:rgba(107,117,255,.16);color:var(--fg);margin-top:2px}
+.primary{margin-top:30px;background:var(--fg);color:var(--bg);padding:16px 28px;font-size:16px;transition:background .3s,transform .4s var(--e)}
+.primary:hover{background:var(--acc);color:var(--fg);transform:translateX(6px)}
+.small{display:block;font-size:13px;color:var(--mute);margin-top:14px}
+/* agent */
+.agrid{display:grid;grid-template-columns:1fr 1.2fr;gap:90px}
+.agrid>div{min-width:0}
+textarea{width:100%;border-bottom:1px solid var(--fg);font-size:22px;padding:12px 0;resize:none;height:110px;line-height:1.4;outline:none}
+textarea::placeholder{color:#6E6C67}
+.syms{margin-top:18px;display:flex;flex-direction:column;align-items:flex-start;gap:8px;font-size:14px;color:var(--mute)}
+.syms button:hover{color:var(--fg)}
+.arow{display:flex;gap:24px;align-items:center}
+#a-stop{font-size:14px;color:var(--mute);margin-top:30px}
+#a-steps{list-style:none;font-size:14px;color:var(--mute);margin-bottom:18px}
+#a-steps li{padding:6px 0;animation:in .5s var(--e) both}
+#a-steps li::before{content:"→ ";color:var(--acc)}
+#a-out{white-space:pre-wrap;font-size:17px;line-height:1.6;min-height:200px;border-top:1px solid var(--fg);padding-top:22px}
+.note{display:block;font-style:normal;color:var(--mute);margin-top:12px;font-size:14px}
+.noagent{display:block}.has-agent .noagent{display:none}
+.agent-only{display:none}.has-agent .agent-only{display:block}
+.tools{list-style:none;border-top:1px solid var(--line);margin-top:20px;font-size:15px}
+.tools li{padding:14px 0;border-bottom:1px solid var(--line);color:#BDBBB4}
+.tools code{color:var(--fg);display:block;font-size:13px;margin-bottom:3px}
+footer{font-size:13px;color:var(--mute);padding:0 56px 40px;max-width:1360px;margin:0 auto;display:flex;justify-content:space-between;gap:20px}
+footer a{color:inherit}
+@media(max-width:900px){
+  header{padding:18px 22px}nav{gap:16px;font-size:13px}
+  .view{padding:96px 22px 60px}
+  .split,.fgrid,.agrid{grid-template-columns:1fr;gap:44px}
+  .split>div+div{padding-left:0;border-left:0;border-top:1px solid var(--line);margin-top:30px}
+  .recon{grid-template-columns:1fr;gap:20px}
+  #findings button,#findings .ok{grid-template-columns:40px 1fr;gap:14px}.ar{grid-column:2;padding-top:0}
+  .t b{font-size:20px}
+  #log li{grid-template-columns:1fr;gap:2px}
+  #f-sample li{grid-template-columns:1fr}
+  footer{padding:0 22px 30px;flex-direction:column}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="mark">Sync<i>Watch</i></div>
+  <nav>
+    <button data-go="overview" class="on">Overview</button>
+    <button data-go="agent">Investigate</button>
+  </nav>
+</header>
+
+<section class="view" id="v-overview">
+  <div class="k">Dynamics 365 F&amp;O → Shopify · n8n · Raml Home (demo)</div>
+  <div class="split">
+    <div>
+      <div class="say">The workflow says</div>
+      <div class="huge ok">Success<small><span id="runs">0</span> runs since go-live. <span id="errs">0</span> errors.</small></div>
+    </div>
+    <div>
+      <div class="say">The data says</div>
+      <div class="huge bad"><span id="n-find">0</span><small id="verdict"></small></div>
+    </div>
+  </div>
+  <div class="recon">
+    <div><b><span id="r-erp">0</span><span id="r-shop">0</span></b>Products in ERP / in Shopify</div>
+    <div><b id="r-drift">0</b>Products with the wrong price or stock</div>
+    <div><b><span id="r-ord">0</span><span id="r-ordE">0</span></b>Store orders / reached the ERP</div>
+  </div>
+  <ul id="findings"></ul>
+  <div class="foot">
+    <span>Every finding comes from evidence a monitor can see: the run log, both systems, and the workflow file.</span>
+    <span><button data-go="agent" class="cta">Investigate with the agent →</button> &nbsp; <button id="reset">Reset demo</button></span>
+  </div>
+  <div id="logwrap" style="display:none"><div class="k" style="margin-top:0">Approved changes</div><ul id="log"></ul></div>
+</section>
+
+<section class="view" id="v-finding">
+  <button class="back" data-go="overview">← Overview</button>
+  <div class="fgrid">
+    <div>
+      <h2 id="f-title"></h2>
+      <p class="lede" id="f-lede"></p>
+      <dl id="f-ev"></dl>
+      <div id="f-samplewrap" style="margin-top:36px"><div class="k" style="margin:0">Examples</div><ul id="f-sample"></ul></div>
+    </div>
+    <div>
+      <p class="cause"><em>Root cause</em><span id="f-cause"></span></p>
+      <div class="k" style="margin:40px 0 0">Change to the workflow</div>
+      <div class="diff"><pre class="b" id="f-before"></pre><pre class="a" id="f-after"></pre></div>
+      <button class="primary" id="approve">Approve: <span id="f-fixlabel"></span></button>
+      <span class="small">The change is replayed against every run since go-live, then both systems are reconciled again. Approvals are logged.</span>
+    </div>
+  </div>
+</section>
+
+<section class="view" id="v-agent">
+  <button class="back" data-go="overview">← Overview</button>
+  <div class="agrid">
+    <div>
+      <div class="k">Investigation agent</div>
+      <h2>Describe what looks wrong. The agent finds out why.</h2>
+      <p class="lede">It reads the run log, compares both systems, opens the workflow and checks single products. It reports causes with evidence. It changes nothing.</p>
+      <div class="agent-only" style="margin-top:44px">
+        <textarea id="a-sym" placeholder="Customers see old prices on some products, and finance says online sales are missing."></textarea>
+        <div class="syms"><span>Or try:</span>
+          <button data-sym>Some new products never appeared on the website.</button>
+          <button data-sym>The store sold items we had no stock for.</button>
+        </div>
+        <div class="arow"><button class="primary" id="a-run">Investigate</button><button id="a-stop" hidden>Stop</button></div>
+      </div>
+    </div>
+    <div>
+      <div class="agent-only"><ul id="a-steps"></ul><div id="a-out"></div></div>
+      <div class="noagent">
+        <div class="k">Its tools</div>
+        <ul class="tools">
+          <li><code>get_run_log</code>Run count, statuses, items fetched against items processed.</li>
+          <li><code>compare_systems</code>Products, prices, stock and orders, ERP against Shopify.</li>
+          <li><code>get_workflow</code>The n8n workflow, with secrets redacted and flagged.</li>
+          <li><code>get_product</code>One SKU as each system holds it, with its dates.</li>
+        </ul>
+        <p class="small" style="margin-top:20px">The live agent runs when this page is opened inside Claude. All tools are read-only.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <span>Demo data. Raml Home is a fictional company.</span>
+  <span>Built by Lana Alzoubi · <a href="https://lanaalzoubi.com" target="_blank" rel="noopener">lanaalzoubi.com</a></span>
+</footer>
+<script>
+/*APP*/
+</script>
+</body>
+</html>
